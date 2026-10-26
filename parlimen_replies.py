@@ -2,7 +2,7 @@
 """Load Malaysian parliamentary replies (Dewan Rakyat / Dewan Negara PDFs) into DuckDB.
 
     python3 parlimen_replies.py ingest [DIR]   # parse every new PDF in DIR (default ./inbox)
-    python3 parlimen_replies.py run            # fetch the URLs in sources.txt into ./inbox, then ingest
+    python3 parlimen_replies.py run            # download new reply PDFs into ./inbox, then ingest
     python3 parlimen_replies.py check          # list replies with no MP, ministry, question or answer
 
 One PDF can hold one reply or many. Each reply becomes one row in the
@@ -15,10 +15,12 @@ patterns below, then run `ingest --force` and `check`.
 import argparse
 import datetime as dt
 import hashlib
+import os
 import re
 import sys
+import tempfile
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 
 import duckdb
 import pdfplumber
@@ -28,30 +30,74 @@ HERE = Path(__file__).resolve().parent
 DB_PATH = HERE / "parlimen.duckdb"
 INBOX = HERE / "inbox"
 SOURCES = HERE / "sources.txt"
+CERTS = HERE / "certs"
+
+SITE = "https://www.parlimen.gov.my"
+# Pages that link the reply PDFs for the current sitting.
+#   jawapan-lisan-dr:      one JDR<ddmmyyyy>.pdf per sitting day, the written
+#                          answers to oral questions not reached in the chamber
+#   jawapan-bukan-lisan-dr: one JBDR<start><end>.pdf per sitting, the written
+#                          questions, posted after the sitting ends
+LISTING_PAGES = [
+    SITE + "/jawapan-lisan-dr.html?uweb=dr&",
+    SITE + "/jawapan-bukan-lisan-dr.html?uweb=dr&",
+]
+# PDF links on those pages appear as loadResult('/files/...pdf', ...) or href.
+PDF_LINK = r"""(?:loadResult\(\s*'|href=["'])([^'"]+?\.pdf)['"]"""
 
 # Regexes, all case-insensitive and multiline. Each runs on the text of one
 # PDF after the drop_lines patterns have removed page furniture.
 TUNE = {
     # Line that begins a new reply. A file with several replies is cut here.
     "start": r"^\s*PERTANYAAN\s*:\s*(?:LISAN|BUKAN\s+LISAN|BERTULIS)\b.*$",
+    # Lines just above "start" that still belong to the reply below
+    # (the notice heading and the question number).
+    "lead": [
+        r"^\s*NO\.?\s*SOALAN\s*:?\s*\d+\s*$",
+        r"^\s*PEMBERITAHUAN\s+PERTANYAAN\b.*$",
+        r"^\s*MESYUARAT\s+\S+\s*,\s*PENGGAL\b.*$",
+        r"^\s*PARLIMEN\s+\S+\s+BELAS\b.*$",
+        r"^\s*DEWAN\s+(?:RAKYAT|NEGARA)\s*$",
+    ],
+    # Running page header repeated on every page of a reply; removed from
+    # the question and answer text after the question number is read.
+    "running_header": r"^\s*NO\.?\s*SOALAN\s*:?\s*\d+\s*$",
     # Lines removed before parsing: page numbers, running headers.
     "drop_lines": [
         r"^\s*\d{1,3}\s*$",
         r"^\s*(?:muka\s+surat|halaman|page)\s*\d+(?:\s*(?:/|dari|of)\s*\d+)?\s*$",
     ],
+    # Multi-line blocks removed before parsing: the cover page listing the
+    # questions, which some files repeat part-way through.
+    "drop_blocks": [
+        r"^\s*JAWAPAN-JAWAPAN\s+BAGI\s+PERTANYAAN[\s\S]*?^\s*NOTA\s*:.*$",
+    ],
+    # Placeholder page for a question answered together with another one:
+    #   NO SOALAN : 22
+    #   [SOALAN NO. 22 DIJAWAB BERSEKALI DENGAN SOALAN NO. 2]
+    # Group 1 is the question, group 2 the question(s) it was answered with.
+    # It becomes a row with answered_with set and no question or answer text.
+    "joint": r"^\s*NO\.?\s*SOALAN\s*:?\s*(\d+)\s*\n\s*\[\s*SOALAN\s+NO\.?\s*\1\s+DIJAWAB\s+BERSEKALI\s+DENGAN\s+SOALAN\s+NO\.?\s*([^\]]+?)\s*\]",
     # Header fields inside one reply. Group 1 is the value.
     "kind": r"^\s*PERTANYAAN\s*:\s*(LISAN|BUKAN\s+LISAN|BERTULIS)\b",
     "question_no": r"(?:NO\.?\s*SOALAN|SOALAN\s*NO\.?)\s*:?\s*(\d+)",
     "date": r"^\s*TARIKH\s*:\s*(.+?)\s*$",
-    # "DARIPADA : TUAN AHMAD BIN ALI [ KAWASAN ]"  -> MP, constituency
-    "mp": r"^\s*DARIPADA\s*:\s*(.+?)\s*(?:\[\s*([^\]]+?)\s*\])?\s*$",
+    # "DARIPADA : TUAN AHMAD BIN ALI [ KAWASAN ]"  -> MP, constituency.
+    # Long names wrap, so one continuation line is allowed.
+    "mp": r"^\s*DARIPADA\s*:\s*([^\[\n]+(?:\n(?!\s*(?:TARIKH|SOALAN)\b)[^\[\n:]+)?)\s*(?:\[\s*([^\]]+?)\s*\])?",
     # "... minta MENTERI KEWANGAN menyatakan ..." -> ministry
     "ministry": r"\bminta\s+((?:TIMBALAN\s+)?(?:PERDANA\s+)?MENTERI\b[\s\S]{0,150}?)\s+(?:menyatakan|memberikan|menjelaskan|mengemukakan|merincikan|memaklumkan)\b",
     # Fallback when the minta ... sentence is missing or broken across pages.
     "ministry_fallback": r"^\s*(KEMENTERIAN\s+[A-Z ,&\-]+?)\s*$",
-    # Markers that open the question and the answer.
-    "question": r"^\s*SOALAN\s*(?:NO\.?\s*\d+\s*)?:?\s*$",
-    "answer": r"^\s*JAWAPAN\s*:?",
+    # Markers that open the question and the answer. Capitals only, so a
+    # question that quotes an earlier "jawapan" isn't cut there.
+    "question": r"^\s*(?-i:SOALAN)\s*(?:NO\.?\s*\d+\s*)?:?\s*$",
+    "answer": r"^\s*(?-i:JAWAPAN)\s*:?(?:\s*$|\s+(?=\S))",
+    # Minister named at the top of an answer, before "Tuan Yang di-Pertua"
+    # (mostly in answers to the Prime Minister's questions):
+    #   YB DATO' SRI AZALINA OTHMAN SAID
+    #   MENTERI DI JABATAN PERDANA MENTERI (UNDANG-UNDANG DAN REFORMASI INSTITUSI)
+    "answered_by": r"\A\s*((?:YAB|YB)\b[\s\S]{0,300}?)\n\s*(?=Tuan\s+Yang\s+di-?Pertua)",
 }
 
 SCHEMA = """
@@ -78,7 +124,15 @@ CREATE TABLE IF NOT EXISTS replies (
     raw_text     VARCHAR,  -- the whole block, for checking the split
     PRIMARY KEY (file_sha256, seq)
 );
+-- Question(s) this one was answered together with; question and answer are
+-- then empty and the text is under the other question.
+ALTER TABLE replies ADD COLUMN IF NOT EXISTS answered_with VARCHAR;
+-- Minister named at the top of the answer, when there is one.
+ALTER TABLE replies ADD COLUMN IF NOT EXISTS answered_by VARCHAR;
 """
+
+COLUMNS = ["file_sha256", "seq", "filename", "kind", "question_no", "date_text", "mp",
+           "constituency", "ministry", "question", "answer", "raw_text", "answered_with", "answered_by"]
 
 FLAGS = re.I | re.M
 
@@ -91,17 +145,34 @@ def clean(s):
     return s or None
 
 
+def one_line(s):
+    return " ".join(s.split()) if s else None
+
+
 def pdf_text(path):
     with pdfplumber.open(path) as pdf:
         pages = [p.extract_text() or "" for p in pdf.pages]
     text = "\n".join(pages)
     for pat in TUNE["drop_lines"]:
         text = re.sub(pat + r"\n?", "", text, flags=FLAGS)
+    for pat in TUNE["drop_blocks"]:
+        text = re.sub(pat + r"\n?", "", text, flags=FLAGS)
     return text, len(pages)
 
 
 def split_replies(text):
-    starts = [m.start() for m in re.finditer(TUNE["start"], text, FLAGS)]
+    lead = re.compile("|".join(f"(?:{p})" for p in TUNE["lead"]), re.I)
+    starts = []
+    for m in re.finditer(TUNE["start"], text, FLAGS):
+        pos = m.start()
+        # Walk back over lead lines so they open this reply, not end the last.
+        while pos > 0:
+            prev = text.rfind("\n", 0, pos - 1) + 1
+            if not lead.fullmatch(text[prev : pos - 1]):
+                break
+            pos = prev
+        starts.append(pos)
+    starts = sorted(set(starts) | {m.start() for m in re.finditer(TUNE["joint"], text, FLAGS)})
     if not starts:
         return [text] if text.strip() else []
     return [text[a:b] for a, b in zip(starts, starts[1:] + [len(text)])]
@@ -112,7 +183,12 @@ def parse_reply(block):
         m = re.search(TUNE[key], block, FLAGS)
         return m.group(1) if m else None
 
-    row = {"raw_text": clean(block)}
+    row = {"raw_text": clean(block), "answered_with": None, "answered_by": None}
+    joint = re.match(TUNE["joint"], block, FLAGS)
+    if joint:
+        return dict(row, kind=None, question_no=int(joint.group(1)), date_text=None, mp=None,
+                    constituency=None, ministry=None, question=None, answer=None,
+                    answered_with=one_line(joint.group(2)))
     kind = first("kind")
     row["kind"] = re.sub(r"\s+", " ", kind.upper()) if kind else None
     qno = first("question_no")
@@ -120,11 +196,13 @@ def parse_reply(block):
     row["date_text"] = clean(first("date"))
 
     m = re.search(TUNE["mp"], block, FLAGS)
-    row["mp"] = clean(m.group(1)) if m else None
-    row["constituency"] = clean(m.group(2)) if m and m.lastindex >= 2 else None
+    row["mp"] = one_line(m.group(1)) if m else None
+    row["constituency"] = one_line(m.group(2)) if m else None
 
     ministry = first("ministry") or first("ministry_fallback")
-    row["ministry"] = clean(re.sub(r"\s+", " ", ministry).upper()) if ministry else None
+    row["ministry"] = one_line(ministry).upper() if ministry else None
+
+    block = re.sub(TUNE["running_header"] + r"\n?", "", block, flags=FLAGS)
 
     a = re.search(TUNE["answer"], block, FLAGS)
     q = re.search(TUNE["question"], block, FLAGS)
@@ -135,7 +213,12 @@ def parse_reply(block):
             mm = re.search(r"^.*\bminta\b", block[: a.start()], FLAGS)
             q_start = mm.start() if mm else None
         row["question"] = clean(block[q_start : a.start()]) if q_start is not None else None
-        row["answer"] = clean(block[a.end() :])
+        answer = block[a.end() :]
+        by = re.match(TUNE["answered_by"], answer, re.I)
+        if by:
+            row["answered_by"] = one_line(by.group(1))
+            answer = answer[by.end() :]
+        row["answer"] = clean(answer)
     else:
         row["question"] = clean(block[q.end() :]) if q else None
         row["answer"] = None
@@ -181,11 +264,10 @@ def ingest(folder, force=False):
             [digest, path.name, pages, len(text.strip()), len(rows), dt.datetime.now()],
         )
         for seq, r in enumerate(rows, 1):
+            r = dict(r, file_sha256=digest, seq=seq, filename=path.name)
             con.execute(
-                "INSERT INTO replies VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                [digest, seq, path.name, r["kind"], r["question_no"], r["date_text"],
-                 r["mp"], r["constituency"], r["ministry"], r["question"], r["answer"],
-                 r["raw_text"]],
+                f"INSERT INTO replies ({', '.join(COLUMNS)}) VALUES ({', '.join('?' * len(COLUMNS))})",
+                [r[c] for c in COLUMNS],
             )
         con.execute("COMMIT")
         new += 1
@@ -207,7 +289,8 @@ def check():
                    CASE WHEN question IS NULL THEN 'question' END,
                    CASE WHEN answer IS NULL THEN 'answer' END) AS missing
         FROM replies
-        WHERE mp IS NULL OR ministry IS NULL OR question IS NULL OR answer IS NULL
+        WHERE answered_with IS NULL
+          AND (mp IS NULL OR ministry IS NULL OR question IS NULL OR answer IS NULL)
         ORDER BY filename, seq
     """).fetchall()
     scanned = con.execute("SELECT filename FROM files WHERE text_chars = 0").fetchall()
@@ -221,24 +304,63 @@ def check():
     return 1 if gaps or scanned else 0
 
 
-def fetch():
-    """Download every URL in sources.txt that isn't already in ./inbox."""
-    if not SOURCES.exists():
-        return 0
-    INBOX.mkdir(exist_ok=True)
-    failed = 0
-    for line in SOURCES.read_text(encoding="utf-8").splitlines():
-        url = line.split("#", 1)[0].strip()
-        if not url:
+def ca_bundle():
+    """The usual CA bundle plus certs/*.pem.
+
+    www.parlimen.gov.my sends its certificate without the Sectigo
+    intermediate, so certs/ holds that intermediate. Verification stays on.
+    """
+    import certifi
+
+    base = os.environ.get("REQUESTS_CA_BUNDLE") or certifi.where()
+    out = tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False)
+    out.write(Path(base).read_text())
+    for pem in sorted(CERTS.glob("*.pem")):
+        out.write("\n" + pem.read_text())
+    out.close()
+    return out.name
+
+
+def listed_urls(session, verify):
+    """PDF URLs linked from LISTING_PAGES, plus any in sources.txt."""
+    urls, failed = [], 0
+    for page in LISTING_PAGES:
+        try:
+            r = session.get(page, timeout=60, verify=verify)
+            r.raise_for_status()
+        except Exception as e:
+            print(f"LISTING FAILED {page}: {e}", file=sys.stderr)
+            failed += 1
             continue
+        found = [urljoin(page, quote(m, safe="/:%()")) for m in re.findall(PDF_LINK, r.text, re.I)]
+        print(f"{page}: {len(found)} PDF link(s)")
+        urls += found
+    if SOURCES.exists():
+        for line in SOURCES.read_text(encoding="utf-8").splitlines():
+            url = line.split("#", 1)[0].strip()
+            if url:
+                urls.append(url)
+    return list(dict.fromkeys(urls)), failed
+
+
+def fetch():
+    """Download every listed PDF that isn't already in ./inbox."""
+    INBOX.mkdir(exist_ok=True)
+    session = requests.Session()
+    session.headers["User-Agent"] = "parlimen-replies/1.0"
+    # Passed per request: requests lets REQUESTS_CA_BUNDLE override session.verify.
+    verify = ca_bundle()
+    urls, failed = listed_urls(session, verify)
+    have = {p.name.lower() for p in INBOX.iterdir()}
+    for url in urls:
         name = Path(unquote(urlparse(url).path)).name or hashlib.sha1(url.encode()).hexdigest()
         if not name.lower().endswith(".pdf"):
             name += ".pdf"
-        dest = INBOX / name
-        if dest.exists():
+        if name.lower() in have:
             continue
+        dest = INBOX / name
         try:
-            r = requests.get(url, timeout=60)
+            r = session.get(url, timeout=120, verify=verify)
             r.raise_for_status()
             if not r.content.startswith(b"%PDF"):
                 raise ValueError("response is not a PDF")
@@ -247,7 +369,9 @@ def fetch():
             failed += 1
             continue
         dest.write_bytes(r.content)
+        have.add(name.lower())
         print(f"fetched {name}")
+    os.unlink(verify)
     return failed
 
 

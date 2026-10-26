@@ -1,2 +1,3 @@
-# One PDF URL per line. `run` downloads any not yet in inbox/, then ingests.
+# Extra PDF URLs, one per line, on top of the pages in LISTING_PAGES.
+# `run` downloads any not yet in inbox/, then ingests.
 # Lines starting with # are ignored.
