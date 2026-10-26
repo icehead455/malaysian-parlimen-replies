@@ -1,6 +1,9 @@
 pdfplumber>=0.11
 duckdb>=1.1
 requests>=2.31
+# pdfminer (under pdfplumber) needs these; some base images ship versions too old to import
+cryptography>=42
+cffi>=1.16
 # tests only
 pytest>=8
 reportlab>=4
