@@ -1,0 +1,6 @@
+pdfplumber>=0.11
+duckdb>=1.1
+requests>=2.31
+# tests only
+pytest>=8
+reportlab>=4

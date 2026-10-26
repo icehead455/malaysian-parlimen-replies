@@ -1,0 +1,2 @@
+# One PDF URL per line. `run` downloads any not yet in inbox/, then ingests.
+# Lines starting with # are ignored.

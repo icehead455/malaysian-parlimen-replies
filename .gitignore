@@ -1,0 +1,5 @@
+# Rebuilt from inbox/ by `ingest`
+parlimen.duckdb
+parlimen.duckdb.wal
+__pycache__/
+.pytest_cache/
