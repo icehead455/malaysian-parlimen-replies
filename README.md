@@ -30,6 +30,31 @@ so `certs/` holds that intermediate (Sectigo Public Server Authentication CA
 DV R36, which chains to the Sectigo R46 root). Downloads are verified
 against the usual CA bundle plus that file.
 
+## Automatic watch (GitHub Actions)
+
+`.github/workflows/watch.yml` runs the fetch on GitHub's own runners every
+two hours, 9am–1am Malaysia time, so it keeps working without any Claude
+cloud credits. Each run does `python3 parlimen_replies.py run`; if a new PDF
+appears it commits it to `main` and emails a plain digest
+(`.github/scripts/notify.py`): the PDF's creation time, the reply count, a
+watchlist keyword sweep (rare earths, house arrest, Najib, pardon), and the
+list of questions with MP and ministry. It does **not** judge newsworthiness
+or draft stories — ask Claude for that when a digest arrives.
+
+To turn it on, add three repository secrets under
+**Settings → Secrets and variables → Actions**:
+
+| Secret | Value |
+|---|---|
+| `SMTP_USER` | the Gmail address to send from |
+| `SMTP_PASS` | a Gmail [App Password](https://myaccount.google.com/apppasswords) (16 chars, not your normal password) |
+| `MAIL_TO` | where to send the digest (often the same address) |
+
+Then run it once by hand from the **Actions** tab (**Run workflow**) to check
+the secrets work. Scheduled runs can be delayed under GitHub load, and GitHub
+disables scheduled workflows after 60 days with no repo commits; a new file
+committing itself resets that clock.
+
 ## Tables
 
 The database is `parlimen.duckdb` (gitignored; rebuilt from `inbox/`).

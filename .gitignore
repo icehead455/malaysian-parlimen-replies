@@ -3,3 +3,6 @@ parlimen.duckdb
 parlimen.duckdb.wal
 __pycache__/
 .pytest_cache/
+
+# scratch list written by the GitHub Actions watch workflow
+new_files.txt

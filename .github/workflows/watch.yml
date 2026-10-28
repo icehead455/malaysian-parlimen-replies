@@ -1,0 +1,66 @@
+name: Parlimen replies watch
+
+# Fetches new Dewan Rakyat reply PDFs, commits them, and emails a digest.
+# Runs on GitHub's own runners, so it does not depend on Claude cloud credits.
+# The editorial screening and story drafts still come from Claude on request.
+
+on:
+  schedule:
+    # Every 2 hours, 9am-1am Malaysia time (UTC+8). Cron is UTC.
+    - cron: '0 1,3,5,7,9,11,13,15,17 * * *'
+  workflow_dispatch: {}   # lets you run it by hand from the Actions tab
+
+permissions:
+  contents: write         # to commit and push new PDFs
+
+concurrency:
+  group: parlimen-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python3 -m pip install -q -r requirements.txt
+
+      - name: Fetch and ingest
+        run: |
+          python3 parlimen_replies.py run
+          python3 parlimen_replies.py check || true
+
+      - name: Detect new PDFs
+        id: detect
+        run: |
+          git ls-files --others --exclude-standard inbox > new_files.txt
+          if [ -s new_files.txt ]; then
+            echo "has_new=true" >> "$GITHUB_OUTPUT"
+            echo "New files:"; cat new_files.txt
+          else
+            echo "has_new=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing new."
+          fi
+
+      - name: Commit and push new PDFs
+        if: steps.detect.outputs.has_new == 'true'
+        run: |
+          git config user.name "parlimen-watch"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # add only the new inbox PDFs (never parlimen.duckdb, which is gitignored)
+          git -c core.quotepath=false add inbox/
+          git commit -m "Add replies fetched $(TZ=Asia/Kuala_Lumpur date +%Y-%m-%d)"
+          git push
+
+      - name: Email digest
+        if: steps.detect.outputs.has_new == 'true'
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: python3 .github/scripts/notify.py new_files.txt
