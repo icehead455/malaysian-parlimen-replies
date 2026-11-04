@@ -55,6 +55,34 @@ the secrets work. Scheduled runs can be delayed under GitHub load, and GitHub
 disables scheduled workflows after 60 days with no repo commits; a new file
 committing itself resets that clock.
 
+## Hansard attendance
+
+`hansard.py` is a separate collector for MP attendance in the Dewan Rakyat.
+Every sitting day's Hansard (Penyata Rasmi) opens with an
+`Ahli-Ahli Yang Hadir` (present) and `Ahli-Ahli Yang Tidak Hadir` (absent)
+list, each naming the member and constituency. The script downloads the
+daily `DR-<ddmmyyyy>.pdf` from the [Hansard
+page](https://www.parlimen.gov.my/hansard-dewan-rakyat.html?uweb=dr&),
+keeps the raw PDFs under `hansard/`, and parses those two lists into
+`attendance.csv` (one row per seat per sitting day, keyed by constituency).
+
+```
+python3 hansard.py run       # download new Hansards, then rebuild attendance.csv
+python3 hansard.py report    # per-MP attendance across all sitting days collected
+```
+
+`.github/workflows/hansard.yml` runs `hansard.py run` twice a day on GitHub's
+runners and commits any new Hansard and the refreshed `attendance.csv` — no
+email, no Claude usage. It needs no secrets. Ask Claude for the attendance
+summary whenever you want one; the full picture is meant for the end of the
+meeting in December.
+
+`attendance.csv` columns: `sitting_date`, `bil` (the Hansard's Bil. number),
+`status` (present/absent), `constituency`, `member`. The constituency is the
+stable key; member names can carry minor spacing glitches from PDF text
+extraction. Senators (Dewan Negara) and the Speaker have no constituency and
+are not counted as seats.
+
 ## Tables
 
 The database is `parlimen.duckdb` (gitignored; rebuilt from `inbox/`).

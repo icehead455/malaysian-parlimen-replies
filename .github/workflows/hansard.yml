@@ -1,0 +1,53 @@
+name: Dewan Rakyat Hansard attendance
+
+# Collects the daily Dewan Rakyat Hansard PDFs and rebuilds attendance.csv
+# (who was present / absent each sitting day). Runs on GitHub's own runners,
+# so it costs nothing against any Claude usage limit. No email — it just
+# accumulates the data; ask Claude for the attendance report.
+
+on:
+  schedule:
+    # Twice daily, 2pm & 10pm Malaysia time (UTC+8). A sitting day's Hansard is
+    # usually published around noon the next day, so an afternoon run catches it.
+    - cron: '0 6,14 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: parlimen-hansard
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python3 -m pip install -q -r requirements.txt
+
+      - name: Fetch new Hansards and rebuild attendance
+        run: python3 hansard.py run
+
+      - name: Commit changes
+        run: |
+          git config user.name "parlimen-watch"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git -c core.quotepath=false add hansard/ attendance.csv
+          if git diff --cached --quiet; then
+            echo "Nothing new."
+            exit 0
+          fi
+          git commit -m "Hansard attendance updated $(TZ=Asia/Kuala_Lumpur date +%Y-%m-%d)"
+          for i in 1 2 3 4; do
+            git push && break
+            echo "push failed, rebasing and retrying ($i)"
+            git pull --rebase --autostash origin main || true
+            sleep $((2 ** i))
+          done
